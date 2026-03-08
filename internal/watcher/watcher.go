@@ -3,6 +3,7 @@ package watcher
 import (
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,6 +31,9 @@ type Watcher struct {
 	fsWatcher  *fsnotify.Watcher
 	events     chan string
 	done       chan struct{}
+	closeOnce  sync.Once
+	started    bool
+	logger     *slog.Logger
 	watchedMu  sync.Mutex
 	watchedSet map[string]struct{}
 }
@@ -58,6 +62,7 @@ func NewWatcher(root string) (*Watcher, error) {
 		fsWatcher:  fsw,
 		events:     make(chan string, 128),
 		done:       make(chan struct{}),
+		logger:     slog.Default(),
 		watchedSet: make(map[string]struct{}),
 	}, nil
 }
@@ -71,8 +76,22 @@ func (w *Watcher) Start() error {
 		return err
 	}
 
+	w.started = true
 	go w.run()
 	return nil
+}
+
+func (w *Watcher) Close() error {
+	var closeErr error
+	w.closeOnce.Do(func() {
+		closeErr = w.fsWatcher.Close()
+		if w.started {
+			<-w.done
+		} else {
+			close(w.done)
+		}
+	})
+	return closeErr
 }
 
 func (w *Watcher) run() {
@@ -113,12 +132,13 @@ func (w *Watcher) run() {
 			if !ok {
 				return
 			}
+			w.logger.Warn("watcher reported an error")
 		}
 	}
 }
 
 func (w *Watcher) addRecursive(root string) error {
-	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -131,8 +151,17 @@ func (w *Watcher) addRecursive(root string) error {
 			return filepath.SkipDir
 		}
 
-		return w.addWatch(path)
+		if watchErr := w.addWatch(path); watchErr != nil {
+			w.logger.Warn("failed to watch directory", "path", path, "error", watchErr)
+			return filepath.SkipDir
+		}
+
+		return nil
 	})
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (w *Watcher) addWatch(path string) error {
@@ -155,14 +184,19 @@ func (w *Watcher) addWatch(path string) error {
 
 func (w *Watcher) removeWatchIfDir(path string) {
 	w.watchedMu.Lock()
-	_, exists := w.watchedSet[path]
-	if exists {
-		delete(w.watchedSet, path)
+	paths := make([]string, 0, 4)
+	for watchedPath := range w.watchedSet {
+		if watchedPath == path || strings.HasPrefix(watchedPath, path+string(os.PathSeparator)) {
+			paths = append(paths, watchedPath)
+		}
+	}
+	for _, p := range paths {
+		delete(w.watchedSet, p)
 	}
 	w.watchedMu.Unlock()
 
-	if exists {
-		_ = w.fsWatcher.Remove(path)
+	for _, p := range paths {
+		_ = w.fsWatcher.Remove(p)
 	}
 }
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log/slog"
 	"os"
@@ -39,26 +40,6 @@ func main() {
 
 	server := process.NewProcessManager(execCmd)
 
-	runBuildAndMaybeRestart := func() {
-		logger.Info("running build", "command", buildCmd)
-		if err := builder.RunBuild(buildCmd); err != nil {
-			logger.Error("build failed", "error", err)
-			return
-		}
-
-		logger.Info("build succeeded")
-		if err := server.Stop(); err != nil {
-			logger.Error("failed to stop previous server", "error", err)
-			return
-		}
-		if err := server.Start(); err != nil {
-			logger.Error("failed to restart server", "error", err)
-		}
-	}
-
-	// Requirement: build immediately on startup.
-	runBuildAndMaybeRestart()
-
 	fsWatcher, err := watcher.NewWatcher(rootDir)
 	if err != nil {
 		logger.Error("failed to initialize watcher", "error", err)
@@ -68,20 +49,90 @@ func main() {
 		logger.Error("failed to start watcher", "error", err)
 		os.Exit(1)
 	}
+	defer func() {
+		if err := fsWatcher.Close(); err != nil {
+			logger.Warn("failed to close watcher", "error", err)
+		}
+	}()
 
 	debounced := debounce.Debounce(fsWatcher.Events(), 500*time.Millisecond)
+	buildTriggers := make(chan struct{}, 1)
+	buildDone := make(chan error, 1)
+
+	queueBuild := func() {
+		select {
+		case buildTriggers <- struct{}{}:
+		default:
+		}
+	}
+
+	// Requirement: build immediately on startup.
+	queueBuild()
+
+	var (
+		buildRunning bool
+		buildQueued  bool
+		buildCancel  context.CancelFunc
+	)
+
+	startBuild := func() {
+		logger.Info("running build", "command", buildCmd)
+		buildCtx, cancel := context.WithCancel(ctx)
+		buildCancel = cancel
+		buildRunning = true
+
+		go func() {
+			buildDone <- builder.RunBuildContext(buildCtx, buildCmd)
+		}()
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			logger.Info("shutting down")
+			if buildCancel != nil {
+				buildCancel()
+			}
 			if err := server.Stop(); err != nil {
 				logger.Error("failed to stop server", "error", err)
 			}
 			return
 		case <-debounced:
-			logger.Info("detected file changes; rebuilding")
-			runBuildAndMaybeRestart()
+			logger.Info("detected file changes")
+			queueBuild()
+		case <-buildTriggers:
+			if buildRunning {
+				buildQueued = true
+				if buildCancel != nil {
+					logger.Info("canceling in-progress build due to newer changes")
+					buildCancel()
+				}
+				continue
+			}
+			startBuild()
+		case err := <-buildDone:
+			buildRunning = false
+
+			if errors.Is(err, context.Canceled) {
+				logger.Info("build canceled")
+			} else if err != nil {
+				logger.Error("build failed", "error", err)
+				logger.Info("keeping current server process running")
+			} else if buildQueued {
+				logger.Info("build finished but newer changes are pending; skipping restart")
+			} else {
+				logger.Info("build succeeded")
+				if stopErr := server.Stop(); stopErr != nil {
+					logger.Error("failed to stop previous server", "error", stopErr)
+				} else if startErr := server.Start(); startErr != nil {
+					logger.Error("failed to restart server", "error", startErr)
+				}
+			}
+
+			if buildQueued {
+				buildQueued = false
+				queueBuild()
+			}
 		}
 	}
 }

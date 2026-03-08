@@ -192,6 +192,6 @@ Three practical takeaways:
 
 ## Demo video
 
-Add demo video link here:
+Here is a video briefly demonstrating the project:
 
-`[Demo Video](https://your-demo-link)`
+`[Demo Video](https://www.loom.com/share/84884494b0fc4413a79174e44eddff4e)`

@@ -194,4 +194,4 @@ Three practical takeaways:
 
 Here is a video briefly demonstrating the project:
 
-`[Demo Video](https://www.loom.com/share/84884494b0fc4413a79174e44eddff4e)`
+[Demo Video](https://www.loom.com/share/84884494b0fc4413a79174e44eddff4e)
